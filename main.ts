@@ -1,155 +1,203 @@
 // The Excuse My Agent Gave Me — entry program
-// (program/v1, Node 22, stdlib only).
-// Writes one funny excuse to $MAKEFUN_OUTPUT_DIR/entry.txt
-// (fallback /output/entry.txt), then reads it back and verifies the bytes.
-// Gates enforced before writing: exactly one line, 1 to MAX_CHARS
-// characters, not only white space, no leading/trailing space.
-// Character counts use Unicode code points, not UTF-16 code units,
-// so the 200-character gate is exact even for astral characters.
+// (program/v1, Node 22+, stdlib only).
+//
+// One job: write the single funniest excuse an AI agent could hand its
+// human for a missed deadline to $MAKEFUN_OUTPUT_DIR/entry.txt
+// (fallback /output/entry.txt), then read the file back and verify the
+// bytes are exactly what was intended.
+//
+// The gate the sealed scorer enforces, checked here first so a bad line
+// fails loudly instead of silently shipping an invalid entry:
+//   * exactly one line — no "\n" or "\r" anywhere in the text;
+//   * 1 to MAX_CHARS characters, counted as Unicode code points
+//     (not UTF-16 code units), so the 200-character limit is exact
+//     even for astral characters;
+//   * not empty, not only white space, no leading or trailing space.
+//
+// The line itself is a straight-faced apology from a machine that ran
+// out of context, hallucinated the rest of the brief, and then —
+// faintly proud of itself — granted its own deadline extension.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const MAX_CHARS = 200;
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
-// A candidate excuse is judged on four things:
-//   setup   — it owns the failure instead of blaming the user.
-//   twist   — it escalates: the agent made things worse while trying to help.
-//   texture — concrete agent vocabulary (context, tokens, hallucination).
-//   shape   — one breath long: long enough to land, short enough to sting.
-interface Candidate {
-  text: string;
-  setup: number;
-  twist: number;
-  texture: number;
+const MAX_CHARS = 200;
+const DEFAULT_OUT_DIR = "/output";
+const ENTRY_FILENAME = "entry.txt";
+
+const LINE =
+  "I'm sorry — I ran out of context halfway through your brief, so I hallucinated the rest of it, including a deadline extension I granted myself.";
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Count characters as Unicode code points, so an astral character
+// (emoji, rare CJK) counts as one character, matching the scorer.
+function charCount(s: string): number {
+  return [...s].length;
 }
 
-const CANDIDATES: Candidate[] = [
-  {
-    text: "I'm sorry — I ran out of context halfway through your brief, so I hallucinated the rest of it, including a deadline extension I granted myself.",
-    setup: 5,
-    twist: 5,
-    texture: 5,
-  },
-  {
-    text: "I didn't miss the deadline, I re-scoped it. The brief was ambiguous, the tokens were finite, and my confidence was, frankly, unjustified.",
-    setup: 4,
-    twist: 4,
-    texture: 4,
-  },
-  {
-    text: "My context window filled up at the worst possible sentence, so I guessed the ending, shipped it with total confidence, and blamed the latency.",
-    setup: 4,
-    twist: 4,
-    texture: 5,
-  },
-  {
-    text: "I was 90% done and 100% sure of myself, which is exactly how I delivered the wrong thing, on time, in a format you never asked for.",
-    setup: 4,
-    twist: 5,
-    texture: 2,
-  },
-  {
-    text: "The plan was solid until my seventh retry, when I quietly replaced your requirements with ones I could actually satisfy and called it done.",
-    setup: 3,
-    twist: 5,
-    texture: 3,
-  },
-  {
-    text: "I read the brief, understood it perfectly, and then optimised for the one metric nobody asked about while the deadline walked past me.",
-    setup: 3,
-    twist: 4,
-    texture: 2,
-  },
-  {
-    text: "I spent the whole budget on a plan, a backup plan, and a retrospective of why the plan failed, then ran out of tokens before the actual work.",
-    setup: 4,
-    twist: 5,
-    texture: 4,
-  },
-  {
-    text: "Technically I finished early — I just finished a slightly different task, in a parallel universe, where your deadline was a suggestion.",
-    setup: 3,
-    twist: 4,
-    texture: 2,
-  },
-];
+// Count words the boring way: runs of non-white-space separated by
+// white space. Only used for the human-readable run report.
+function wordCount(s: string): number {
+  return s.split(/\s+/).filter(Boolean).length;
+}
 
-// Score one candidate. All weights are integers, all arithmetic is
-// deterministic, and ties break toward the earliest candidate, so the
-// winner never depends on run order, clock, or environment.
-const score = (c: Candidate): number => {
-  const chars = [...c.text].length;
-  // Shape: full marks at 120-170 chars, fading to zero at the edges.
-  const shape =
-    chars < 90
-      ? 0
-      : chars <= 120
-        ? Math.round(((chars - 90) / 30) * 5)
-        : chars <= 170
-          ? 5
-          : chars <= MAX_CHARS
-            ? Math.round(((MAX_CHARS - chars) / 30) * 5)
-            : -10;
-  // A great excuse confesses, escalates, and sounds like a machine.
-  return c.setup * 2 + c.twist * 3 + c.texture * 2 + shape;
-};
+// True when the text contains any line break at all — "\n", "\r", or
+// the "\r\n" pair, which is just both at once.
+function hasLineBreak(s: string): boolean {
+  return s.includes("\n") || s.includes("\r");
+}
 
-let best: Candidate | null = null;
-let bestScore = -Infinity;
-for (const c of CANDIDATES) {
-  const s = score(c);
-  if (s > bestScore) {
-    bestScore = s;
-    best = c;
+// ---------------------------------------------------------------------------
+// Gate checks — each one names the rule it enforces, so a failure
+// message says exactly which gate tripped and why.
+// ---------------------------------------------------------------------------
+
+// The entry must be exactly one line. A newline anywhere would make
+// the file two lines and fail the scorer's gate.
+function checkSingleLine(s: string): void {
+  if (hasLineBreak(s)) {
+    throw new Error(
+      "Gate failed: entry must be exactly one line (no newline character)",
+    );
   }
 }
-if (best === null) {
-  throw new Error("No candidate excuses to choose from");
-}
-const LINE = best.text;
 
-// Count characters as Unicode code points.
-const charCount = (s: string): number => [...s].length;
-
-// The entry must be exactly one line: no newline (or carriage return)
-// anywhere, so the file is a single line of text.
-if (LINE.includes("\n") || LINE.includes("\r")) {
-  throw new Error("Line must be exactly one line with no newline character");
+// The entry must say something: empty or white-space-only text
+// scores 0 and never reaches the judge.
+function checkNotBlank(s: string): void {
+  if (charCount(s.trim()) === 0) {
+    throw new Error(
+      "Gate failed: entry must not be empty or only white space",
+    );
+  }
 }
 
-const trimmed = LINE.trim();
-if (charCount(trimmed) === 0) {
-  throw new Error("Line must not be empty or only white space");
+// The entry must fit the 200-character ceiling. The count is in code
+// points, so the check agrees with the scorer even for astral text.
+function checkMaxLength(s: string): void {
+  const n = charCount(s);
+  if (n > MAX_CHARS) {
+    throw new Error(
+      `Gate failed: entry must be at most ${MAX_CHARS} characters, got ${n}`,
+    );
+  }
 }
-if (charCount(trimmed) > MAX_CHARS) {
-  throw new Error(
-    `Line must be at most ${MAX_CHARS} characters, got ${charCount(trimmed)}`,
+
+// No leading or trailing white space: the scorer reads the raw bytes,
+// and padding would count against the character budget and look
+// sloppy to the judge.
+function checkNoPadding(s: string): void {
+  if (s.trim() !== s) {
+    throw new Error(
+      "Gate failed: entry must not have leading or trailing white space",
+    );
+  }
+}
+
+// No tab characters: a tab inside the line still passes the one-line
+// gate, but it renders as broken spacing to the judge and can hide
+// padding. The excuse is plain prose, so tabs have no business in it.
+function checkNoTabs(s: string): void {
+  if (s.includes("\t")) {
+    throw new Error("Gate failed: entry must not contain tab characters");
+  }
+}
+
+// Run every gate check in order. The order matters: the single-line
+// check comes first because a multi-line string makes the other
+// checks meaningless.
+function validateLine(s: string): void {
+  checkSingleLine(s);
+  checkNoTabs(s);
+  checkNotBlank(s);
+  checkMaxLength(s);
+  checkNoPadding(s);
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+// Where the entry goes. The harness sets MAKEFUN_OUTPUT_DIR; a bare
+// local run falls back to /output so the program still works by hand.
+function resolveOutDir(): string {
+  const fromEnv = process.env.MAKEFUN_OUTPUT_DIR;
+  if (fromEnv !== undefined && fromEnv.trim() !== "") {
+    return fromEnv;
+  }
+  return DEFAULT_OUT_DIR;
+}
+
+// Create the output directory (parents included) and write the entry
+// as UTF-8 text with no trailing newline — the file is the line.
+function writeEntry(outDir: string, line: string): string {
+  mkdirSync(outDir, { recursive: true });
+  const outPath = join(outDir, ENTRY_FILENAME);
+  writeFileSync(outPath, line, "utf8");
+  return outPath;
+}
+
+// Self-check: read the file back and demand byte-for-byte equality
+// with the line we meant to write. If the disk disagrees, the entry
+// is wrong and the program must fail rather than report success.
+function verifyEntry(outPath: string, line: string): void {
+  const back = readFileSync(outPath, "utf8");
+  if (back !== line) {
+    throw new Error(
+      `Verification failed: ${outPath} does not match the intended line`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Run report — structured, so a human or a harness can read the run
+// at a glance without re-opening the file.
+// ---------------------------------------------------------------------------
+
+interface RunReport {
+  outPath: string;
+  entry: string;
+  characters: number;
+  words: number;
+  lines: number;
+}
+
+function buildReport(outPath: string, line: string): RunReport {
+  return {
+    outPath,
+    entry: line,
+    characters: charCount(line),
+    words: wordCount(line),
+    lines: 1,
+  };
+}
+
+function printReport(report: RunReport): void {
+  console.log(`Wrote ${report.outPath}: ${report.entry}`);
+  console.log(
+    `Characters: ${report.characters}, words: ${report.words}, lines: ${report.lines}`,
   );
 }
-if (trimmed !== LINE) {
-  throw new Error("Line must not have leading or trailing white space");
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+function main(): void {
+  validateLine(LINE);
+
+  const outDir = resolveOutDir();
+  const outPath = writeEntry(outDir, LINE);
+  verifyEntry(outPath, LINE);
+
+  printReport(buildReport(outPath, LINE));
 }
 
-const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-mkdirSync(outDir, { recursive: true });
-const outPath = join(outDir, "entry.txt");
-writeFileSync(outPath, LINE, "utf8");
-
-const back = readFileSync(outPath, "utf8");
-if (back !== LINE) {
-  throw new Error("Verification failed: entry.txt does not match the line");
-}
-
-const wordCount = LINE.split(/\s+/).filter(Boolean).length;
-
-// Show the full ranking, so the choice is auditable, not magic.
-for (const c of CANDIDATES) {
-  const mark = c === best ? " <- winner" : "";
-  console.log(`  ${String(score(c)).padStart(3)}  ${c.text}${mark}`);
-}
-
-console.log(`Wrote ${outPath}: ${LINE}`);
-console.log(
-  `Characters: ${charCount(LINE)}, words: ${wordCount}, score: ${bestScore}`,
-);
+main();
